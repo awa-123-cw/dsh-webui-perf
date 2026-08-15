@@ -3,3 +3,6 @@ node_modules/
 # 调试/备份产物
 host-debug.log
 *.bak-*
+
+# 本地打包产物
+*.tgz
