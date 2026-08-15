@@ -1,9 +1,10 @@
 diff --git a/packages/client/ui-attachment/src/MessageImage.tsx b/packages/client/ui-attachment/src/MessageImage.tsx
-index c4de8f7..90740f8 100644
+index c4de8f7..72e0727 100644
 --- a/packages/client/ui-attachment/src/MessageImage.tsx
 +++ b/packages/client/ui-attachment/src/MessageImage.tsx
 @@ -1,5 +1,6 @@
- import { useCallback, useEffect, useMemo, useState } from 'react'
+-import { useCallback, useEffect, useMemo, useState } from 'react'
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
  import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 +import { isPerfEnabled } from '@deepseek-ai/dsh-client-ui-primitives'
  import { ImageLightbox } from './ImageLightbox.tsx'
@@ -97,26 +98,63 @@ index c4de8f7..90740f8 100644
  /** Display box for a lone image (DeepSeek Chat rule): long edge 240px with
   * the rendered aspect ratio clamped to [0.25, 4] — the overflow is cropped by
   * `object-fit: cover` — and never upscaled past the image's natural size. The
-@@ -78,6 +160,13 @@ export function MessageImage({ attachment, load, variant, labels }: {
-     return () => { live = false }
-   }, [attachment, load, attempt])
+@@ -69,20 +151,49 @@ export function MessageImage({ attachment, load, variant, labels }: {
+     () => (variant === 'single' ? singleFit(attachment) : undefined),
+     [attachment, variant],
+   )
++  // Visibility gate: off-screen history images (long sessions, many tiles)
++  // neither fetch nor decode until scrolled near the viewport (+300px margin).
++  // `content-visibility` skips render/layout but not the component's effects —
++  // without this gate every image in a loaded window would still allocate a
++  // blob URL + decoded bitmap, the dominant memory cost of image-heavy chats.
++  const rootRef = useRef<HTMLDivElement | null>(null)
++  const [visible, setVisible] = useState(() => typeof IntersectionObserver === 'undefined')
++  useEffect(() => {
++    if (visible) return
++    const element = rootRef.current
++    if (element === null) return
++    const observer = new IntersectionObserver((entries) => {
++      if (entries.some(entry => entry.isIntersecting)) {
++        setVisible(true)
++        observer.disconnect()
++      }
++    }, { rootMargin: '300px' })
++    observer.observe(element)
++    return () => observer.disconnect()
++  }, [visible])
  
+   useEffect(() => {
++    if (!visible) return
+     let live = true
+     setError(false)
+     setSrc(null)
+     void load(attachment).then((url) => { if (live) setSrc(url) }).catch(() => { if (live) setError(true) })
+     return () => { live = false }
+-  }, [attachment, load, attempt])
++  }, [attachment, load, attempt, visible])
++
 +  // History thumbnail: downscaled copy (bounds GPU/CPU decode memory for
 +  // multi-megapixel sources). While the downscale is in flight the original is
 +  // NOT decoded (loading placeholder); only a failed downscale falls back to
 +  // the original. The click-to-open lightbox always uses the original.
 +  const thumb = useThumbnailSrc(src)
 +  const showOriginal = thumb.state === 'fallback'
-+
+ 
    const label = attachment.name ?? labels.image
    if (error) return <button type="button" className={css.error} data-variant={variant} onClick={request}>{labels.loadFailed}</button>
    return (
-@@ -91,9 +180,9 @@ export function MessageImage({ attachment, load, variant, labels }: {
+     <>
+       <button
++        ref={rootRef}
+         type="button"
+         className={css.frame}
+         data-variant={variant}
+@@ -91,9 +202,9 @@ export function MessageImage({ attachment, load, variant, labels }: {
          aria-label={labels.openNamed(label)}
          onClick={() => { if (src !== null) setOpen(true) }}
        >
 -        {src === null
-+        {src === null || (!showOriginal && thumb.state === 'loading')
++        {!visible || src === null || (!showOriginal && thumb.state === 'loading')
            ? <span className={css.loading}>{labels.loading}</span>
 -          : <img src={src} alt={label} style={fit === undefined ? undefined : { objectPosition: fit.objectPosition }} />}
 +          : <img src={showOriginal ? src ?? undefined : thumb.url ?? undefined} alt={label} style={fit === undefined ? undefined : { objectPosition: fit.objectPosition }} />}
@@ -474,7 +512,7 @@ index 7f2fb1c..b0cc5b8 100644
      if (copied) return
      /* v8 ignore next -- both arms always mount a <pre>; trimmed is the
 diff --git a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx b/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
-index 4dff78d..c12abe4 100644
+index 4dff78d..ee19f96 100644
 --- a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
 +++ b/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
 @@ -15,6 +15,7 @@ import { memo, useMemo, useRef } from 'react'
@@ -498,8 +536,8 @@ index 4dff78d..c12abe4 100644
 + * size cap and mention-bearing renders (whose handlers close over the
 + * per-owner resolver) bypass the cache entirely.
 + */
-+const SETTLED_CACHE_MAX = 48
-+const SETTLED_CACHE_MAX_TEXT = 256 * 1024
++const SETTLED_CACHE_MAX = 16
++const SETTLED_CACHE_MAX_TEXT = 64 * 1024
 +const settledCache = new Map<string, { codeLabels: MarkdownCodeLabels | undefined; children: ReactNode[] }>()
 +
 +/** {@link renderSettled} behind the settled-render cache (see the cache docs above). */
@@ -540,7 +578,7 @@ index 4dff78d..c12abe4 100644
      if (streamRef.current === null || streamLabelsRef.current !== codeLabels) {
        streamRef.current = new StreamingRenderer(codeLabels)
 diff --git a/packages/client/ui-primitives/src/markdown/highlight.ts b/packages/client/ui-primitives/src/markdown/highlight.ts
-index 16fb544..604558c 100644
+index 16fb544..5c37b8c 100644
 --- a/packages/client/ui-primitives/src/markdown/highlight.ts
 +++ b/packages/client/ui-primitives/src/markdown/highlight.ts
 @@ -25,6 +25,7 @@ import langBash from '@shikijs/langs/shellscript'
@@ -551,7 +589,7 @@ index 16fb544..604558c 100644
  
  /** A shiki grammar module's default export (a `LanguageRegistration[]`), taken
   *  from a boot grammar so no direct `@shikijs/types` dependency is needed. */
-@@ -250,21 +251,93 @@ function ensureGrammar(resolved: string): boolean {
+@@ -250,21 +251,100 @@ function ensureGrammar(resolved: string): boolean {
  const warmupTimer = setTimeout(() => { highlighter() }, 0)
  ;(warmupTimer as { unref?: () => void }).unref?.()
  
@@ -564,7 +602,12 @@ index 16fb544..604558c 100644
 + * oldest-first once the cap is reached, and keys hold references to strings
 + * the render tree already owns, so the cache never copies payload bytes.
 + */
-+const MAX_HIGHLIGHT_CACHE = 256
++const MAX_HIGHLIGHT_CACHE = 64
++/** Cached highlight payloads above this size are dropped instead of retained
++ *  (a 256-entry cache of multi-KB fences is a significant memory footprint;
++ *  large fences re-highlight rarely and only on remount, so caching them buys
++ *  little). */
++const MAX_HIGHLIGHT_CACHE_BYTES = 64 * 1024
 +const htmlCache = new Map<string, string>()
 +const linesCache = new Map<string, HighlightSpan[][]>()
 +
@@ -579,6 +622,8 @@ index 16fb544..604558c 100644
 +  if (hit !== undefined) return hit
 +  const value = compute()
 +  if (value === undefined) return undefined
++  // Oversized payloads bypass the cache (memory budget — see the cap docs).
++  if (typeof value === 'string' && value.length > MAX_HIGHLIGHT_CACHE_BYTES) return value
 +  if (map.size >= MAX_HIGHLIGHT_CACHE) {
 +    const oldest = map.keys().next().value
 +    if (oldest !== undefined) map.delete(oldest)
@@ -650,7 +695,7 @@ index 16fb544..604558c 100644
  }
  
  /**
-@@ -297,6 +370,17 @@ export function highlightLines(code: string, lang: string | undefined): Highligh
+@@ -297,6 +377,17 @@ export function highlightLines(code: string, lang: string | undefined): Highligh
    const resolved = lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
    if (resolved === undefined) return undefined
    if (!ensureGrammar(resolved)) return undefined
@@ -668,7 +713,7 @@ index 16fb544..604558c 100644
    const { tokens } = highlighter().codeToTokens(code, { lang: resolved, theme: 'css-variables' })
    // shiki tokenizes `a\nb` into two lines; a trailing newline (`a\n`) adds a
    // third, empty line the caller's own line array does not carry. Drop that
-@@ -309,3 +393,9 @@ export function highlightLines(code: string, lang: string | undefined): Highligh
+@@ -309,3 +400,9 @@ export function highlightLines(code: string, lang: string | undefined): Highligh
      : tokens
    return lines.map(line => line.map(token => ({ text: token.content, style: { color: token.color } })))
  }
@@ -799,7 +844,7 @@ index 18638a2..5f49dd8 100644
      if (firstUnstable > 0) {
        const cutEnd = blocks[firstUnstable - 1]?.position?.end.offset
 diff --git a/packages/client/ui-primitives/src/markdown/katex.tsx b/packages/client/ui-primitives/src/markdown/katex.tsx
-index 45c1226..ae8adbc 100644
+index 45c1226..911d59e 100644
 --- a/packages/client/ui-primitives/src/markdown/katex.tsx
 +++ b/packages/client/ui-primitives/src/markdown/katex.tsx
 @@ -18,6 +18,7 @@
@@ -834,7 +879,7 @@ index 45c1226..ae8adbc 100644
 + * formula per frame. Bounded oldest-first like the highlight caches; keys
 + * reference strings the render tree already owns.
 + */
-+const MAX_KATEX_CACHE = 512
++const MAX_KATEX_CACHE = 128
 +const katexResultCache = new Map<string, ReactNode>()
 +
 +/** The uncached render body ({@link renderTexToReact} adds the cache). */
