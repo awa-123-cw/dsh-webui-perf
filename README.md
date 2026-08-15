@@ -100,6 +100,22 @@ node patches/apply-runtime-patches.mjs --reverse
 # 从 profile package.json 的 dependencies/bundles 移除 dsh-webui-perf，重启即可
 ```
 
+## 🔍 升级后检测（重要）
+
+**dsh 官方升级会覆盖 node_modules 产物，补丁可能悄悄失效**（开关不再起作用，且设置面板会显示「补丁缺失」警告）。升级后请运行健康检测：
+
+```bash
+node patches/check-patches.mjs          # 检测三类补丁痕迹（allowlist / client bundle / dist）
+node patches/check-patches.mjs --fix    # 缺失时自动重打 api-proxy allowlist
+```
+
+检测项：
+1. **api-proxy allowlist** 是否仍含 `webui-perf`（设置开关暴露的前提）
+2. **ui-conversation / ui-trajectory client bundle** 是否含优化开关代码
+3. **web dist**（index.html 实际引用的 chunk）是否含 ui-primitives 优化代码
+
+检测结果也**实时显示在设置面板**：官方补丁缺失时，开关行变为红色警告（「补丁缺失：请重跑 patches/apply-runtime-patches.mjs 后重启 dsh」），不会假装生效。
+
 ## ✅ 兼容性
 
 - deepseek-harness `0.1.0-rc.5` / `0.1.0-rc.6`
