@@ -12,6 +12,7 @@ DeepSeek Harness Web GUI 性能优化开关插件：长代码流式渲染、历�
 | 长思考（Think 块） | 展开正文 100ms 节流更新，折叠摘要保持实时 |
 | 重复渲染 | shiki 高亮 / KaTeX / settled markdown 渲染三层 LRU 缓存 |
 | 读大文件 | ReadBlock 折叠时只高亮可见窗口（head/tail 16 行） |
+| 内存/显存 | 消息列表 `content-visibility`（离屏行跳过渲染/布局，长会话内存有界 + 滚动流畅）；历史图片缩略图降采样到 ≤640px（原图解码内存/显存省 70%+，点击查看仍加载原图） |
 
 实测：打开长代码历史会话的主线程冻结从 **8.3s → 0.3s**（-96%）。
 
@@ -27,7 +28,8 @@ dsh-webui-perf/
 └── patches/
     ├── dsh-webui-perf.patch        # 对 deepseek-harness 源码的补丁（git apply）
     ├── apply-patches.mjs           # 源码补丁应用/回滚脚本
-    └── apply-runtime-patches.mjs   # 已安装环境的运行时补丁（api-proxy allowlist）
+    ├── apply-runtime-patches.mjs   # 已安装环境的运行时补丁（api-proxy allowlist）
+    └── check-patches.mjs           # 补丁健康检测（升级后必跑）
 ```
 
 > 为什么需要补丁：优化代码在官方包内部（`ui-primitives` 是 shell 平台模块、`ui-conversation`/`ui-trajectory` 是官方 client bundle，插件无法替换），因此优化以**带开关的源码补丁**形式随插件发布；插件本体负责开关 UI 与状态广播（localStorage + `dsh:webui-perf-change` 事件，cordis-free 通道）。关闭开关即回退官方原始实现。

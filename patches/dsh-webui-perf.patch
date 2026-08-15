@@ -1,3 +1,149 @@
+diff --git a/packages/client/ui-attachment/src/MessageImage.tsx b/packages/client/ui-attachment/src/MessageImage.tsx
+index c4de8f7..90740f8 100644
+--- a/packages/client/ui-attachment/src/MessageImage.tsx
++++ b/packages/client/ui-attachment/src/MessageImage.tsx
+@@ -1,5 +1,6 @@
+ import { useCallback, useEffect, useMemo, useState } from 'react'
+ import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
++import { isPerfEnabled } from '@deepseek-ai/dsh-client-ui-primitives'
+ import { ImageLightbox } from './ImageLightbox.tsx'
+ import type { ImageLightboxLabels } from './ImageLightbox.tsx'
+ import css from './MessageImage.module.css'
+@@ -23,6 +24,87 @@ export interface MessageImageLabels {
+   lightbox: ImageLightboxLabels
+ }
+ 
++/**
++ * Thumbnail decode cap (long edge, px). History tiles display at 240px max and
++ * message lists can hold many images; decoding the ORIGINAL bitmap for every
++ * thumbnail wastes GPU/CPU memory on multi-megapixel sources. Downscaling to
++ * this cap keeps quality at the rendered size while bounding decode cost.
++ * The click-to-open lightbox keeps loading the ORIGINAL image.
++ */
++const THUMBNAIL_MAX_EDGE = 640
++
++/**
++ * Downscale `src` to a ≤ {@link THUMBNAIL_MAX_EDGE} thumbnail object URL via
++ * canvas (aspect preserved). Returns the current thumbnail state:
++ * - `loading`: downscale in flight — the caller must NOT decode the original
++ *   yet, or the memory win is lost;
++ * - `ready`: downscaled thumbnail URL (revoked on unmount / source change);
++ * - `fallback`: downscale unavailable/failed (or the performance switch is
++ *   off) — the caller renders the ORIGINAL url.
++ */
++function useThumbnailSrc(src: string | null): { state: 'loading' | 'ready' | 'fallback'; url: string | null } {
++  const [thumb, setThumb] = useState<{ state: 'ready'; url: string } | { state: 'fallback' } | null>(null)
++  useEffect(() => {
++    if (src === null) {
++      setThumb(null)
++      return
++    }
++    if (!isPerfEnabled()) {
++      setThumb({ state: 'fallback' })
++      return
++    }
++    let live = true
++    let objectUrl: string | null = null
++    setThumb(null)
++    void (async () => {
++      let blobUrl: string | null = null
++      try {
++        const response = await fetch(src)
++        if (!live) return
++        const blob = await response.blob()
++        blobUrl = URL.createObjectURL(blob)
++        const image = new Image()
++        image.decoding = 'async'
++        await new Promise<void>((resolve, reject) => {
++          image.onload = () => resolve()
++          image.onerror = () => reject(new Error('image decode failed'))
++          image.src = blobUrl!
++        })
++        const scale = Math.min(1, THUMBNAIL_MAX_EDGE / image.naturalWidth, THUMBNAIL_MAX_EDGE / image.naturalHeight)
++        const width = Math.max(1, Math.round(image.naturalWidth * scale))
++        const height = Math.max(1, Math.round(image.naturalHeight * scale))
++        const canvas = document.createElement('canvas')
++        canvas.width = width
++        canvas.height = height
++        const context = canvas.getContext('2d')
++        if (context === null) throw new Error('canvas 2d unavailable')
++        context.drawImage(image, 0, 0, width, height)
++        URL.revokeObjectURL(blobUrl)
++        blobUrl = null
++        const thumbnail = await new Promise<Blob>((resolve, reject) => {
++          canvas.toBlob((result) => {
++            if (result !== null) resolve(result)
++            else reject(new Error('canvas toBlob failed'))
++          }, 'image/jpeg', 0.82)
++        })
++        if (!live) return
++        objectUrl = URL.createObjectURL(thumbnail)
++        setThumb({ state: 'ready', url: objectUrl })
++      } catch {
++        if (live) setThumb({ state: 'fallback' })
++      } finally {
++        if (blobUrl !== null) URL.revokeObjectURL(blobUrl)
++      }
++    })()
++    return () => {
++      live = false
++      if (objectUrl !== null) URL.revokeObjectURL(objectUrl)
++    }
++  }, [src])
++  if (thumb === null) return { state: 'loading', url: null }
++  return thumb.state === 'ready' ? { state: 'ready', url: thumb.url } : { state: 'fallback', url: null }
++}
++
+ /** Display box for a lone image (DeepSeek Chat rule): long edge 240px with
+  * the rendered aspect ratio clamped to [0.25, 4] — the overflow is cropped by
+  * `object-fit: cover` — and never upscaled past the image's natural size. The
+@@ -78,6 +160,13 @@ export function MessageImage({ attachment, load, variant, labels }: {
+     return () => { live = false }
+   }, [attachment, load, attempt])
+ 
++  // History thumbnail: downscaled copy (bounds GPU/CPU decode memory for
++  // multi-megapixel sources). While the downscale is in flight the original is
++  // NOT decoded (loading placeholder); only a failed downscale falls back to
++  // the original. The click-to-open lightbox always uses the original.
++  const thumb = useThumbnailSrc(src)
++  const showOriginal = thumb.state === 'fallback'
++
+   const label = attachment.name ?? labels.image
+   if (error) return <button type="button" className={css.error} data-variant={variant} onClick={request}>{labels.loadFailed}</button>
+   return (
+@@ -91,9 +180,9 @@ export function MessageImage({ attachment, load, variant, labels }: {
+         aria-label={labels.openNamed(label)}
+         onClick={() => { if (src !== null) setOpen(true) }}
+       >
+-        {src === null
++        {src === null || (!showOriginal && thumb.state === 'loading')
+           ? <span className={css.loading}>{labels.loading}</span>
+-          : <img src={src} alt={label} style={fit === undefined ? undefined : { objectPosition: fit.objectPosition }} />}
++          : <img src={showOriginal ? src ?? undefined : thumb.url ?? undefined} alt={label} style={fit === undefined ? undefined : { objectPosition: fit.objectPosition }} />}
+       </button>
+       {open && src !== null && <ImageLightbox src={src} alt={label} labels={labels.lightbox} onClose={close} />}
+     </>
+diff --git a/packages/client/ui-conversation/src/client/chat/ChatView.module.css b/packages/client/ui-conversation/src/client/chat/ChatView.module.css
+index d16608c..87f8a22 100644
+--- a/packages/client/ui-conversation/src/client/chat/ChatView.module.css
++++ b/packages/client/ui-conversation/src/client/chat/ChatView.module.css
+@@ -45,9 +45,15 @@
+ }
+ 
+ /* Settled-flow identity boundary. It is neutral today and becomes the natural
+-   measurement/mount unit for a virtualizer without changing the column gap. */
++   measurement/mount unit for a virtualizer without changing the column gap.
++   `content-visibility: auto` skips render/layout/paint for off-screen rows —
++   long histories keep DOM memory bounded and scroll smooth; the intrinsic-size
++   `auto` keyword remembers each row's measured height once rendered, so
++   scrollHeight stays accurate for follow-scroll and load-older anchoring. */
+ .flowItem {
+   min-width: 0;
++  content-visibility: auto;
++  contain-intrinsic-size: auto 120px;
+ }
+ 
+ /* A keyed renderer may intentionally decline its row after dispatch (the
 diff --git a/packages/client/ui-conversation/src/client/chat/ReasoningRow.tsx b/packages/client/ui-conversation/src/client/chat/ReasoningRow.tsx
 index f8a340d..bf04866 100644
 --- a/packages/client/ui-conversation/src/client/chat/ReasoningRow.tsx
@@ -217,6 +363,16 @@ index a6a83d3..6bbcd01 100644
        </div>
      </div>
    )
+diff --git a/packages/client/ui-primitives/src/index.ts b/packages/client/ui-primitives/src/index.ts
+index 05baf26..641f67b 100644
+--- a/packages/client/ui-primitives/src/index.ts
++++ b/packages/client/ui-primitives/src/index.ts
+@@ -47,4 +47,5 @@ export type { MarkdownCodeLabels, MarkdownFileMentions } from './markdown/Markdo
+ export { MessageText } from './markdown/MessageText.tsx'
+ export { extractMarkdownPlainText } from './markdown/plain-text.ts'
+ export type { MarkdownPlainTextMode, MarkdownPlainTextOptions } from './markdown/plain-text.ts'
++export { isPerfEnabled } from './markdown/perf.ts'
+ export * from './icons/index.tsx'
 diff --git a/packages/client/ui-primitives/src/markdown/CodeBlock.tsx b/packages/client/ui-primitives/src/markdown/CodeBlock.tsx
 index 7f2fb1c..b0cc5b8 100644
 --- a/packages/client/ui-primitives/src/markdown/CodeBlock.tsx
