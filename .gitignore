@@ -6,3 +6,4 @@ host-debug.log
 
 # 本地打包产物
 *.tgz
+clean-debug.log
