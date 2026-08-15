@@ -1,0 +1,818 @@
+diff --git a/packages/client/ui-conversation/src/client/chat/ReasoningRow.tsx b/packages/client/ui-conversation/src/client/chat/ReasoningRow.tsx
+index f8a340d..bf04866 100644
+--- a/packages/client/ui-conversation/src/client/chat/ReasoningRow.tsx
++++ b/packages/client/ui-conversation/src/client/chat/ReasoningRow.tsx
+@@ -2,6 +2,7 @@
+ import { useEffect, useRef, useState } from 'react'
+ import { DisclosureRow, IconThinkOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
+ import type { ChatViewSlotProps } from '../contract/slots.ts'
++import { isPerfEnabled } from '../perf.ts'
+ import { useThrottledVisualUpdate } from './use-throttled-visual-update.ts'
+ import a11yCss from './accessibility.module.css'
+ import css from './ReasoningRow.module.css'
+@@ -26,6 +27,35 @@ function latestLine(text: string): string {
+  */
+ export function ReasoningRow({ text, running, t }: { text: string; running: boolean; t: ChatViewSlotProps['t'] }) {
+   const [expanded, setExpanded] = useState(false)
++  // The expanded body shows a ~100ms-throttled copy of the streaming text:
++  // long reasoning streams update many times per frame window, and re-diffing
++  // a growing multi-KB text node on every one of those updates is the dominant
++  // cost of an open Think block. The folded summary row stays live per frame
++  // (it is one line), and the throttle collapses as soon as the stream stops.
++  // The performance switch disables the throttle (original live text).
++  const throttle = isPerfEnabled()
++  const [displayText, setDisplayText] = useState(text)
++  const latestTextRef = useRef(text)
++  const shownTextRef = useRef(text)
++  latestTextRef.current = text
++  useEffect(() => {
++    if (throttle && running && expanded) {
++      const id = window.setInterval(() => {
++        const latest = latestTextRef.current
++        if (latest !== shownTextRef.current) {
++          shownTextRef.current = latest
++          setDisplayText(latest)
++        }
++      }, 100)
++      return () => window.clearInterval(id)
++    }
++    // Settled, collapsed, or switch-off: keep the rendered body in lockstep.
++    const latest = latestTextRef.current
++    if (latest !== shownTextRef.current) {
++      shownTextRef.current = latest
++      setDisplayText(latest)
++    }
++  }, [throttle, running, expanded])
+   const summaryRef = useRef<HTMLSpanElement>(null)
+   const summary = running ? latestLine(text) : firstLine(text)
+   const scheduleSummaryScroll = useThrottledVisualUpdate(() => {
+@@ -58,7 +88,7 @@ export function ReasoningRow({ text, running, t }: { text: string; running: bool
+           </>
+         )}
+       >
+-        <div className={css.thinkBody}>{text}</div>
++        <div className={css.thinkBody}>{displayText}</div>
+       </DisclosureRow>
+     </div>
+   )
+diff --git a/packages/client/ui-conversation/src/client/conversation-nodes/assistant.ts b/packages/client/ui-conversation/src/client/conversation-nodes/assistant.ts
+index 880bbaf..3aa3b69 100644
+--- a/packages/client/ui-conversation/src/client/conversation-nodes/assistant.ts
++++ b/packages/client/ui-conversation/src/client/conversation-nodes/assistant.ts
+@@ -8,6 +8,7 @@ import {
+ } from '@deepseek-ai/dsh-client-runtime/client'
+ import type {} from '@deepseek-ai/dsh-llm-retry/types'
+ import type { AssistantChatData } from '../contract/chat-nodes.ts'
++import { isPerfEnabled } from '../perf.ts'
+ import { CHAT_SYNTHETIC_SEQ_OFFSETS, chatNode } from './common.ts'
+ 
+ declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
+@@ -81,6 +82,16 @@ function updateChunk(state: AssistantState, match: ConversationMatch): Assistant
+   if (match.event.type !== 'assistant/chunk') return state
+   const chunk = match.event.data.chunk
+   const blocks = [...state.blocks]
++  // Visibility is monotone (hidden never recovers), so each delta only needs to
++  // prove visibility for ITS OWN bytes: scanning the whole accumulated text on
++  // every chunk — the `hasVisibleContent(compactBlocks(blocks))` fallback —
++  // forces a V8 rope flatten + O(accumulated) scan per chunk, which makes
++  // history replay (hundreds of chunks folded in one pass) quadratic in the
++  // reply length. Incremental checks keep per-chunk work at O(delta). The
++  // performance switch selects the incremental path; disabled keeps the
++  // original whole-text scan.
++  const incremental = isPerfEnabled()
++  let visible = state.hidden === false
+   switch (chunk.type) {
+     case 'block-start':
+       blocks[chunk.index] = emptyAssistantBlock(chunk.blockType)
+@@ -88,11 +99,13 @@ function updateChunk(state: AssistantState, match: ConversationMatch): Assistant
+     case 'text-delta': {
+       const previous = blocks[chunk.index]
+       blocks[chunk.index] = { kind: 'text', text: (previous?.kind === 'text' ? previous.text : '') + chunk.text }
++      if (incremental && chunk.text.trim() !== '') visible = true
+       break
+     }
+     case 'reasoning-delta': {
+       const previous = blocks[chunk.index]
+       blocks[chunk.index] = { kind: 'reasoning', text: (previous?.kind === 'reasoning' ? previous.text : '') + chunk.text }
++      if (incremental && chunk.text.trim() !== '') visible = true
+       break
+     }
+     case 'tool-call-delta': {
+@@ -106,18 +119,25 @@ function updateChunk(state: AssistantState, match: ConversationMatch): Assistant
+         name: chunk.name ?? base.name,
+         argsRaw: base.argsRaw + chunk.argumentsDelta,
+       }
++      // Tool-call blocks do not count as visible content (hasVisibleContent).
+       break
+     }
+-    case 'block-end':
+-      blocks[chunk.index] = toAssistantBlock(chunk.block)
++    case 'block-end': {
++      const block = toAssistantBlock(chunk.block)
++      blocks[chunk.index] = block
++      if (incremental && hasVisibleContent([block])) visible = true
+       break
++    }
+     case 'usage':
+       return { ...state, usage: chunk.usage }
+     default:
+       return state
+   }
+-  const visible = hasVisibleContent(compactBlocks(blocks))
+   const firstToken = isTokenDelta(chunk)
++  if (!incremental) {
++    const whole = hasVisibleContent(compactBlocks(blocks))
++    visible = whole
++  }
+   return {
+     ...state,
+     blocks,
+diff --git a/packages/client/ui-primitives/src/ReadBlock.tsx b/packages/client/ui-primitives/src/ReadBlock.tsx
+index a6a83d3..6bbcd01 100644
+--- a/packages/client/ui-primitives/src/ReadBlock.tsx
++++ b/packages/client/ui-primitives/src/ReadBlock.tsx
+@@ -18,6 +18,7 @@ import {
+   subscribeGrammarLoaded,
+   type HighlightSpan,
+ } from './markdown/highlight.ts'
++import { isPerfEnabled } from './markdown/perf.ts'
+ import css from './ReadBlock.module.css'
+ 
+ /**
+@@ -84,10 +85,6 @@ export function ReadBlock({
+   // plain text while its language's grammar imported picks up highlighting. The
+   // snapshot value is opaque; only its change across renders drives the memo.
+   const loaded = useSyncExternalStore(subscribeGrammarLoaded, grammarLoadCount, grammarLoadCount)
+-  // Per-line highlighted runs aligned 1:1 with `lines`; undefined for an
+-  // unknown/absent (or not-yet-loaded) language, when every line renders as
+-  // bare text.
+-  const highlighted = useMemo(() => highlightLines(raw, lang), [raw, lang, loaded])
+   const [expanded, setExpanded] = useState(false)
+   const [copied, setCopied] = useState(false)
+ 
+@@ -114,6 +111,31 @@ export function ReadBlock({
+   // the note states that so a reader is not misled that the file ends here.
+   const windowed = lines.length < totalLines
+ 
++  // Highlight ONLY the visible rows: a capped card shows maxLines rows, and
++  // tokenizing the whole file's window (potentially thousands of lines) to
++  // render 16 would make every read of a large file a synchronous long task.
++  // Head and tail tokenize as two separate snippets (each ≤ maxLines, cheap),
++  // which is exactly the visual seam the cap already draws; expanding the card
++  // re-tokenizes the full window once — an explicit user action, and the result
++  // is cached for the collapse round-trip. With the performance switch off the
++  // whole window is tokenized as one unit (the pre-optimization behavior).
++  const windowedHighlight = isPerfEnabled()
++  const headSlice = useMemo(
++    () => (capped && windowedHighlight ? lines.slice(0, headLines) : lines),
++    [capped, windowedHighlight, headLines, lines],
++  )
++  const tailSlice = useMemo(
++    () => (capped && windowedHighlight ? lines.slice(lines.length - tailLines) : []),
++    [capped, windowedHighlight, tailLines, lines],
++  )
++  const headRaw = useMemo(() => headSlice.map(line => line.text).join('\n'), [headSlice])
++  const tailRaw = useMemo(() => tailSlice.map(line => line.text).join('\n'), [tailSlice])
++  // Per-line highlighted runs aligned 1:1 with each slice; undefined for an
++  // unknown/absent (or not-yet-loaded) language, when every line renders as
++  // bare text.
++  const headHighlighted = useMemo(() => highlightLines(headRaw, lang), [headRaw, lang, loaded])
++  const tailHighlighted = useMemo(() => highlightLines(tailRaw, lang), [tailRaw, lang, loaded])
++
+   /**
+    * Render a slice of the line array as gutter-numbered rows.
+    * @param slice - the lines to draw, each with its aligned run array.
+@@ -127,10 +149,12 @@ export function ReadBlock({
+       </div>
+     ))
+ 
+-  // Pair each line with its aligned run array up front, so head/tail slicing
+-  // keeps the two in step without re-indexing.
+-  const paired = lines.map((line, index): readonly [ReadBlockLine, readonly HighlightSpan[] | undefined] =>
+-    [line, highlighted?.[index]])
++  // Pair each visible line with its aligned run array up front, so head/tail
++  // slicing keeps the two in step without re-indexing.
++  const headPaired = headSlice.map((line, index): readonly [ReadBlockLine, readonly HighlightSpan[] | undefined] =>
++    [line, headHighlighted?.[index]])
++  const tailPaired = tailSlice.map((line, index): readonly [ReadBlockLine, readonly HighlightSpan[] | undefined] =>
++    [line, tailHighlighted?.[index]])
+ 
+   return (
+     <div className={clsx(css.block, className)} data-read="">
+@@ -153,7 +177,7 @@ export function ReadBlock({
+         </div>
+       </div>
+       <div className={css.body}>
+-        {rows(capped ? paired.slice(0, headLines) : paired)}
++        {rows(headPaired)}
+         {hidden > 0 && (
+           <button
+             type="button"
+@@ -165,7 +189,7 @@ export function ReadBlock({
+             {expanded ? '收起' : `… 其余 ${hidden} 行`}
+           </button>
+         )}
+-        {capped && rows(paired.slice(paired.length - tailLines))}
++        {capped && rows(tailPaired)}
+       </div>
+     </div>
+   )
+diff --git a/packages/client/ui-primitives/src/markdown/CodeBlock.tsx b/packages/client/ui-primitives/src/markdown/CodeBlock.tsx
+index 7f2fb1c..b0cc5b8 100644
+--- a/packages/client/ui-primitives/src/markdown/CodeBlock.tsx
++++ b/packages/client/ui-primitives/src/markdown/CodeBlock.tsx
+@@ -3,13 +3,32 @@
+ // shiki highlighting for the registered grammars and an identical-geometry
+ // plain fallback for everything else. Chrome (language banner + copy) matches
+ // deepsuite `@deepseek/md` code blocks; token colors stay on `--shiki-*`.
++//
++// Highlighting cost scales with the source size, so large fences are kept OFF
++// the render critical path: a settled reply containing several multi-KB code
++// blocks would otherwise pay all their tokenizations back-to-back in one
++// synchronous long task (the classic "stream just finished and the page
++// froze" jank). Small fences highlight synchronously exactly as before; a
++// fence above {@link LAZY_HIGHLIGHT_THRESHOLD} first renders plain and swaps
++// in the highlighted tree from an idle callback, so the UI stays responsive
++// while the tokenizer works.
+ 
+-import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from 'react'
++import { useCallback, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
+ import clsx from 'clsx'
+ import { writeClipboard } from '../clipboard.ts'
+-import { grammarLoadCount, highlightToHtml, subscribeGrammarLoaded } from './highlight.ts'
++import { grammarLoadCount, highlightToHtmlCached, highlightToHtmlNow, subscribeGrammarLoaded } from './highlight.ts'
++import { isPerfEnabled } from './perf.ts'
+ import css from './CodeBlock.module.css'
+ 
++/**
++ * Fences at or below this many characters highlight synchronously (the
++ * existing behavior); larger ones render plain first and highlight in an idle
++ * callback. Shiki's JS regex engine scans in the tens-of-ms range per ~1-3 KB
++ * of real code, so this keeps the synchronous cost bounded to a handful of ms
++ * per block while never blocking the main thread for the big ones.
++ */
++const LAZY_HIGHLIGHT_THRESHOLD = 3000
++
+ export interface CodeBlockProps {
+   /** The source text, rendered verbatim (trailing newline trimmed for display). */
+   code: string
+@@ -23,16 +42,58 @@ export interface CodeBlockProps {
+   copiedLabel?: string | undefined
+ }
+ 
++/** Run `fn` in the next idle window, degrading to a short timeout. Returns a cancellable handle. */
++function scheduleIdle(fn: () => void): { cancel: () => void } {
++  if (typeof window.requestIdleCallback === 'function') {
++    const id = window.requestIdleCallback(fn, { timeout: 600 })
++    return { cancel: () => window.cancelIdleCallback(id) }
++  }
++  const id = window.setTimeout(fn, 32)
++  return { cancel: () => window.clearTimeout(id) }
++}
++
+ export function CodeBlock({ code, lang, className, copyLabel = '复制', copiedLabel = '复制成功' }: CodeBlockProps) {
+   const trimmed = code.endsWith('\n') ? code.slice(0, -1) : code
+   // Re-render when a lazy grammar finishes loading, so a fence that showed plain
+   // text while its language's grammar imported picks up highlighting. The
+-  // snapshot value is opaque; only its change across renders drives the memo.
++  // snapshot value is opaque; only its change across renders drives the effect.
+   const loaded = useSyncExternalStore(subscribeGrammarLoaded, grammarLoadCount, grammarLoadCount)
+-  const html = useMemo(() => highlightToHtml(trimmed, lang), [trimmed, lang, loaded])
++  // Large fences highlight lazily only while the performance switch is on;
++  // disabled, every fence computes synchronously (the pre-optimization path).
++  const lazy = isPerfEnabled() && trimmed.length > LAZY_HIGHLIGHT_THRESHOLD
++  // Render-path read: cache hits only (any size). The first tokenization for a
++  // lazy fence lands in the idle effect below; small fences compute
++  // synchronously in the layout effect, exactly one commit after mount.
++  const [html, setHtml] = useState<string | undefined>(() => highlightToHtmlCached(trimmed, lang))
+   const rootRef = useRef<HTMLDivElement>(null)
+   const [copied, setCopied] = useState(false)
+ 
++  // Layout effect: small fences compute synchronously BEFORE paint (the same
++  // commit-cycle behavior as the former render-phase memo, so no plain flash);
++  // lazy fences schedule the compute for idle time.
++  useLayoutEffect(() => {
++    if (html !== undefined) return
++    if (!lazy) {
++      // Small fence: synchronous compute (bounded, tens of ms at most) so the
++      // settled view is highlighted in the same commit cycle as before.
++      const next = highlightToHtmlNow(trimmed, lang)
++      if (next !== undefined) setHtml(next)
++      return
++    }
++    // Another block may have computed (and cached) this exact fence since the
++    // last render — re-check before scheduling any work.
++    const cached = highlightToHtmlCached(trimmed, lang)
++    if (cached !== undefined) {
++      setHtml(cached)
++      return
++    }
++    const job = scheduleIdle(() => {
++      const next = highlightToHtmlNow(trimmed, lang)
++      if (next !== undefined) setHtml(next)
++    })
++    return job.cancel
++  }, [trimmed, lang, loaded, html, lazy])
++
+   const onCopy = useCallback(() => {
+     if (copied) return
+     /* v8 ignore next -- both arms always mount a <pre>; trimmed is the
+diff --git a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx b/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
+index 4dff78d..bc03b16 100644
+--- a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
++++ b/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
+@@ -15,6 +15,7 @@ import { memo, useMemo, useRef } from 'react'
+ import type { ReactNode } from 'react'
+ import { IncrementalMarkdownParser } from './incremental.ts'
+ import { parseGfm, parseGfmWithMath } from './parse.ts'
++import { isPerfEnabled } from './perf.ts'
+ import {
+   collectReferenceTargets, createReferenceTargets, renderBlocks, renderFootnoteSection,
+   wrapBlockChildren,
+@@ -50,6 +51,39 @@ function renderSettled(
+   return section === null ? blocks : [...blocks, '\n', section]
+ }
+ 
++/**
++ * Settled-render cache. A settled message's element tree is a pure function of
++ * its source text plus the (identity-stable) code labels, so a re-mounted
++ * MarkdownText — session switch, tab flip, sidebar preview — reuses the prior
++ * parse + element build instead of re-parsing every message from scratch.
++ * Bounded oldest-first like the highlight caches; message texts beyond the
++ * size cap and mention-bearing renders (whose handlers close over the
++ * per-owner resolver) bypass the cache entirely.
++ */
++const SETTLED_CACHE_MAX = 48
++const SETTLED_CACHE_MAX_TEXT = 256 * 1024
++const settledCache = new Map<string, { codeLabels: MarkdownCodeLabels | undefined; children: ReactNode[] }>()
++
++/** {@link renderSettled} behind the settled-render cache (see the cache docs above). */
++function renderSettledCached(
++  text: string,
++  codeLabels: MarkdownCodeLabels | undefined,
++  fileMentions: MarkdownFileMentions | undefined,
++): ReactNode[] {
++  if (fileMentions !== undefined || text.length > SETTLED_CACHE_MAX_TEXT || !isPerfEnabled()) {
++    return renderSettled(text, codeLabels, fileMentions)
++  }
++  const hit = settledCache.get(text)
++  if (hit !== undefined && hit.codeLabels === codeLabels) return hit.children
++  const children = renderSettled(text, codeLabels, fileMentions)
++  if (settledCache.size >= SETTLED_CACHE_MAX) {
++    const oldest = settledCache.keys().next().value
++    if (oldest !== undefined) settledCache.delete(oldest)
++  }
++  settledCache.set(text, { codeLabels, children })
++  return children
++}
++
+ /**
+  * Streaming render state for one growing message: the incremental parser,
+  * the frozen blocks' cached elements, and the reference/footnote state their
+@@ -164,7 +198,7 @@ export const MarkdownText = memo(function MarkdownText({ text, streaming = false
+   const children = useMemo(() => {
+     if (!streaming) {
+       streamRef.current = null
+-      return renderSettled(text, codeLabels, fileMentions)
++      return renderSettledCached(text, codeLabels, fileMentions)
+     }
+     if (streamRef.current === null || streamLabelsRef.current !== codeLabels) {
+       streamRef.current = new StreamingRenderer(codeLabels)
+diff --git a/packages/client/ui-primitives/src/markdown/highlight.ts b/packages/client/ui-primitives/src/markdown/highlight.ts
+index 16fb544..eeb32d0 100644
+--- a/packages/client/ui-primitives/src/markdown/highlight.ts
++++ b/packages/client/ui-primitives/src/markdown/highlight.ts
+@@ -25,6 +25,7 @@ import langBash from '@shikijs/langs/shellscript'
+ import langJson from '@shikijs/langs/json'
+ import type { HighlighterCore } from 'shiki/core'
+ import type { CSSProperties } from 'react'
++import { isPerfEnabled } from './perf.ts'
+ 
+ /** A shiki grammar module's default export (a `LanguageRegistration[]`), taken
+  *  from a boot grammar so no direct `@shikijs/types` dependency is needed. */
+@@ -250,21 +251,93 @@ function ensureGrammar(resolved: string): boolean {
+ const warmupTimer = setTimeout(() => { highlighter() }, 0)
+ ;(warmupTimer as { unref?: () => void }).unref?.()
+ 
++/**
++ * Highlight-result caches. Shiki's tokenization is the single most expensive
++ * render step in the markdown pipeline (a large fence can take hundreds of ms
++ * synchronously), so identical (code, lang) pairs — a code block re-rendering
++ * after a lazy-grammar load, a details panel showing the same payload, a
++ * session being revisited — never re-tokenize. Bounded: entries are dropped
++ * oldest-first once the cap is reached, and keys hold references to strings
++ * the render tree already owns, so the cache never copies payload bytes.
++ */
++const MAX_HIGHLIGHT_CACHE = 256
++const htmlCache = new Map<string, string>()
++const linesCache = new Map<string, HighlightSpan[][]>()
++
++/** One (lang, code) cache key; lang is the already-resolved grammar id. */
++function highlightKey(resolved: string, code: string): string {
++  return `${resolved}\u0000${code}`
++}
++
++/** Read `map` at `key`, or compute, store (bounded, oldest-first), and return. */
++function cachedOrCompute<T>(map: Map<string, T>, key: string, compute: () => T | undefined): T | undefined {
++  const hit = map.get(key)
++  if (hit !== undefined) return hit
++  const value = compute()
++  if (value === undefined) return undefined
++  if (map.size >= MAX_HIGHLIGHT_CACHE) {
++    const oldest = map.keys().next().value
++    if (oldest !== undefined) map.delete(oldest)
++  }
++  map.set(key, value)
++  return value
++}
++
++/**
++ * Highlight `code` into shiki's HTML when `lang` maps to a registered grammar
++ * AND the result is already cached; `undefined` means "no cached result" (the
++ * caller renders its plain fallback now and re-checks later). Never performs
++ * tokenization itself, so a render pass can consult it freely — the expensive
++ * compute happens off the critical path in {@link highlightToHtmlNow}.
++ * A lazy grammar not yet loaded still starts its import here. With the
++ * performance switch off the cache is bypassed (always `undefined`), so the
++ * synchronous compute path behaves exactly as before the caching work.
++ * @param code - the source text.
++ * @param lang - the language hint (a markdown fence info string or a fixed caller id).
++ * @returns the cached highlighted HTML, or `undefined` for unknown / not-yet-loaded / not-yet-computed.
++ */
++export function highlightToHtmlCached(code: string, lang: string | undefined): string | undefined {
++  const resolved = lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
++  if (resolved === undefined) return undefined
++  if (!ensureGrammar(resolved)) return undefined
++  return isPerfEnabled() ? htmlCache.get(highlightKey(resolved, code)) : undefined
++}
++
++/**
++ * Tokenize `code` into shiki's HTML NOW (synchronously), caching the result.
++ * Use outside the render critical path (idle callbacks, effects) or when the
++ * cost is known-small; {@link highlightToHtmlCached} is the render-side read.
++ * @param code - the source text.
++ * @param lang - the language hint (a markdown fence info string or a fixed caller id).
++ * @returns the highlighted HTML, or `undefined` for unknown or not-yet-loaded languages.
++ */
++export function highlightToHtmlNow(code: string, lang: string | undefined): string | undefined {
++  const resolved = lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
++  if (resolved === undefined) return undefined
++  if (!ensureGrammar(resolved)) return undefined
++  if (!isPerfEnabled()) {
++    return highlighter().codeToHtml(code, { lang: resolved, theme: 'css-variables' })
++  }
++  const key = highlightKey(resolved, code)
++  const cached = htmlCache.get(key)
++  if (cached !== undefined) return cached
++  return cachedOrCompute(htmlCache, key, () => highlighter().codeToHtml(code, { lang: resolved, theme: 'css-variables' }))
++}
++
+ /**
+  * Highlight `code` into shiki's HTML (a single `<pre class="shiki">` tree)
+  * when `lang` maps to a registered grammar; `undefined` means the caller
+  * renders its plain fallback. A lazy grammar not yet loaded returns `undefined`
+  * for this call and loads in the background; subscribe with
+- * {@link onGrammarLoaded} to re-highlight once it registers.
++ * {@link onGrammarLoaded} to re-highlight once it registers. Synchronous and
++ * cached — prefer {@link highlightToHtmlCached} on render paths and
++ * {@link highlightToHtmlNow} off them.
+  * @param code - the source text.
+  * @param lang - the language hint (a markdown fence info string or a fixed caller id).
+  * @returns the highlighted HTML, or `undefined` for unknown or not-yet-loaded languages.
+  */
+ export function highlightToHtml(code: string, lang: string | undefined): string | undefined {
+-  const resolved = lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
+-  if (resolved === undefined) return undefined
+-  if (!ensureGrammar(resolved)) return undefined
+-  return highlighter().codeToHtml(code, { lang: resolved, theme: 'css-variables' })
++  return highlightToHtmlNow(code, lang)
+ }
+ 
+ /**
+@@ -297,6 +370,17 @@ export function highlightLines(code: string, lang: string | undefined): Highligh
+   const resolved = lang === undefined ? undefined : LANG_ALIASES.get(lang.toLowerCase())
+   if (resolved === undefined) return undefined
+   if (!ensureGrammar(resolved)) return undefined
++  if (!isPerfEnabled()) {
++    return tokenizeLines(code, resolved)
++  }
++  const key = highlightKey(resolved, code)
++  const cached = linesCache.get(key)
++  if (cached !== undefined) return cached
++  return cachedOrCompute(linesCache, key, () => tokenizeLines(code, resolved))
++}
++
++/** Tokenize `code` into per-line highlighted runs (uncached; see {@link highlightLines}). */
++function tokenizeLines(code: string, resolved: string): HighlightSpan[][] {
+   const { tokens } = highlighter().codeToTokens(code, { lang: resolved, theme: 'css-variables' })
+   // shiki tokenizes `a\nb` into two lines; a trailing newline (`a\n`) adds a
+   // third, empty line the caller's own line array does not carry. Drop that
+diff --git a/packages/client/ui-primitives/src/markdown/incremental.ts b/packages/client/ui-primitives/src/markdown/incremental.ts
+index 18638a2..5f49dd8 100644
+--- a/packages/client/ui-primitives/src/markdown/incremental.ts
++++ b/packages/client/ui-primitives/src/markdown/incremental.ts
+@@ -24,7 +24,8 @@
+  * renders literally until the settled full parse self-heals it.
+  */
+ 
+-import type { Root, RootContent } from 'mdast'
++import type { Code, Root, RootContent } from 'mdast'
++import { isPerfEnabled } from './perf.ts'
+ 
+ /**
+  * Trailing blocks kept unstable. Appended text reshapes at most the last
+@@ -33,6 +34,67 @@ import type { Root, RootContent } from 'mdast'
+  */
+ const UNSTABLE_TAIL_BLOCKS = 2
+ 
++/**
++ * Whether `slice` is an OPEN (unclosed) fenced code block: its first line is a
++ * fence opener and no later line closes it. Fence lines are detected by the
++ * CommonMark shape (3+ backticks or tildes at line start; the opener may carry
++ * an info string, the closer only trailing whitespace), which is exactly the
++ * subset micromark's own fence constructs accept for the code flow.
++ *
++ * This is a cheap line scan (a regex over the slice) that runs once per
++ * streaming chunk on the unstable tail — orders of magnitude cheaper than a
++ * full micromark parse, which is the whole point of the fast path it gates.
++ *
++ * @param slice - the current re-parse region (the source behind `tailStart`).
++ * @returns whether the region is an open fence awaiting its closer.
++ */
++function isOpenFenceSlice(slice: string): boolean {
++  // A fence line: up to 3 spaces of indentation (CommonMark allows it), then
++  // 3+ backticks or tildes, anything allowed after. Indented code blocks (4+
++  // spaces) miss on purpose — they never match the marker. Two or more fence
++  // lines means the last one (or an inner one) closes the block — conservative:
++  // any ambiguity falls back to the real parser.
++  let count = 0
++  for (const _match of slice.matchAll(/^ {0,3}[`~]{3,}[^\n]*$/gm)) {
++    count += 1
++    if (count >= 2) return false
++  }
++  return count === 1
++}
++
++/**
++ * Extend a previously-parsed open-fence `code` node with newly appended
++ * source, skipping the full micromark re-parse. Only reachable when the
++ * previous frame's tail was exactly one fenced `code` block and the slice
++ * still holds no closing fence, so the mdast shape cannot change: the block
++ * stays a single `code` node whose value grows by exactly the appended bytes.
++ * A fresh node is minted per frame (the renderer keeps parsed nodes
++ * immutable), carrying the prior lang/meta and a position spanning the slice.
++ *
++ * @param previous - the previous frame's sole code node.
++ * @param slice - the current re-parse region.
++ * @param added - the bytes appended since the previous frame (full-text delta).
++ * @returns the extended code node.
++ */
++function extendOpenFence(previous: Code, slice: string, added: string): Code {
++  const endOffset = slice.length
++  const newlineCount = (slice.match(/\n/g) ?? []).length
++  return {
++    type: 'code',
++    lang: previous.lang,
++    meta: previous.meta,
++    value: previous.value + added,
++    position: {
++      start: previous.position?.start ?? { line: 1, column: 1, offset: 0 },
++      end: {
++        line: newlineCount + 1,
++        column: 1,
++        offset: endOffset,
++      },
++    },
++  }
++}
++
+ /** A top-level mdast block plus a render key that is stable across chunks. */
+ export interface PositionedBlock {
+   /** The parsed block. Positions inside it are relative to its parse slice. */
+@@ -101,11 +163,36 @@ export class IncrementalMarkdownParser {
+       this.prevText = ''
+       this.tailStart = 0
+       this.frozen = []
++      this.cached = null
+       this.generation += 1
+     }
++    const previousText = this.prevText
+     this.prevText = text
+     const base = this.tailStart
+-    const blocks = this.parse(text.slice(base)).children
++    const slice = text.slice(base)
++    // Fast path: the unstable tail is exactly one OPEN fenced code block.
++    // Appended bytes can only extend that block's value, so re-deriving the
++    // node from the previous frame's value plus the append delta skips the
++    // full micromark re-parse of the growing fence — the dominant streaming
++    // cost for long code replies (per-chunk work drops from O(tail) to O(delta)).
++    // Any other tail shape (including a now-closed fence) falls through to the
++    // real parser below.
++    const prevTail = this.cached?.tail
++    if (prevTail !== undefined && prevTail.length === 1 && isPerfEnabled()) {
++      const only = prevTail[0]!.node
++      // A fenced `code` block (fence lines present in the slice — indented
++      // blocks have no markers and never match) whose tail is still open.
++      // `lang`/`meta` are copied verbatim, so info-less fences work too.
++      if (only.type === 'code' && isOpenFenceSlice(slice)) {
++        const tail = [{
++          node: extendOpenFence(only, slice, text.slice(previousText.length)),
++          key: prevTail[0]!.key,
++        }]
++        this.cached = { frozen: [...this.frozen], tail, generation: this.generation }
++        return this.cached
++      }
++    }
++    const blocks = this.parse(slice).children
+     let firstUnstable = Math.max(0, blocks.length - UNSTABLE_TAIL_BLOCKS)
+     if (firstUnstable > 0) {
+       const cutEnd = blocks[firstUnstable - 1]?.position?.end.offset
+diff --git a/packages/client/ui-primitives/src/markdown/katex.tsx b/packages/client/ui-primitives/src/markdown/katex.tsx
+index 45c1226..4dace3e 100644
+--- a/packages/client/ui-primitives/src/markdown/katex.tsx
++++ b/packages/client/ui-primitives/src/markdown/katex.tsx
+@@ -18,6 +18,7 @@
+ import { createElement } from 'react'
+ import type { CSSProperties, ReactNode } from 'react'
+ import katex from 'katex'
++import { isPerfEnabled } from './perf.ts'
+ 
+ /**
+  * Convert one inline `style` attribute string into React's style object.
+@@ -64,6 +65,31 @@ function domToReact(node: ChildNode, key: number): ReactNode {
+  * parse (colored with KaTeX's stock `errorColor`, matching rehype-katex).
+  */
+ export function renderTexToReact(value: string, displayMode: boolean): ReactNode {
++  if (!isPerfEnabled()) return renderTexToReactUncached(value, displayMode)
++  const key = `${displayMode ? 'b' : 'i'}\u0000${value}`
++  const hit = katexResultCache.get(key)
++  if (hit !== undefined) return hit
++  const result = renderTexToReactUncached(value, displayMode)
++  if (katexResultCache.size >= MAX_KATEX_CACHE) {
++    const oldest = katexResultCache.keys().next().value
++    if (oldest !== undefined) katexResultCache.delete(oldest)
++  }
++  katexResultCache.set(key, result)
++  return result
++}
++
++/**
++ * KaTeX render results are pure functions of (source, displayMode) and their
++ * element trees are immutable, so settled streams and re-rendered messages
++ * reuse prior work instead of re-running `renderToString` + `DOMParser` per
++ * formula per frame. Bounded oldest-first like the highlight caches; keys
++ * reference strings the render tree already owns.
++ */
++const MAX_KATEX_CACHE = 512
++const katexResultCache = new Map<string, ReactNode>()
++
++/** The uncached render body ({@link renderTexToReact} adds the cache). */
++function renderTexToReactUncached(value: string, displayMode: boolean): ReactNode {
+   let html: string
+   try {
+     html = katex.renderToString(value, { displayMode, throwOnError: true })
+diff --git a/packages/client/ui-trajectory/src/client/trajectory-assistant-definition.ts b/packages/client/ui-trajectory/src/client/trajectory-assistant-definition.ts
+index 3614d4e..359878e 100644
+--- a/packages/client/ui-trajectory/src/client/trajectory-assistant-definition.ts
++++ b/packages/client/ui-trajectory/src/client/trajectory-assistant-definition.ts
+@@ -7,6 +7,7 @@ import {
+   displayFailureMessage, emptyAssistantBlock, isTokenDelta, toAssistantBlock,
+   toAssistantBlocks,
+ } from '@deepseek-ai/dsh-client-runtime/client'
++import { isPerfEnabled } from './perf.ts'
+ import { trajectoryNode } from './trajectory-definition-common.ts'
+ 
+ /* jscpd:ignore-start -- Target-owned Definitions intentionally keep their event
+@@ -111,6 +112,15 @@ function updateChunk(state: AssistantState, match: ConversationMatch): Assistant
+     return { ...state, sawChunk: true, usage: addUsage(state.usage, chunk.usage) }
+   }
+   const blocks = [...state.blocks]
++  // Visibility is monotone (firstVisibleSeq is only ever assigned once), so
++  // each delta only needs to prove visibility for ITS OWN bytes. The
++  // `hasVisibleContent(compactBlocks(blocks))` fallback re-scans (and V8
++  // rope-flattens) the whole accumulated text on every chunk — quadratic
++  // during history replay, where hundreds of chunks fold in one synchronous
++  // pass. The performance switch selects the incremental path; disabled keeps
++  // the original whole-text scan.
++  const incremental = isPerfEnabled()
++  let visible = state.firstVisibleSeq !== undefined
+   switch (chunk.type) {
+     case 'block-start':
+       blocks[chunk.index] = emptyAssistantBlock(chunk.blockType)
+@@ -121,6 +131,7 @@ function updateChunk(state: AssistantState, match: ConversationMatch): Assistant
+         kind: 'text',
+         text: (previous?.kind === 'text' ? previous.text : '') + chunk.text,
+       }
++      if (incremental && chunk.text.trim() !== '') visible = true
+       break
+     }
+     case 'reasoning-delta': {
+@@ -129,6 +140,7 @@ function updateChunk(state: AssistantState, match: ConversationMatch): Assistant
+         kind: 'reasoning',
+         text: (previous?.kind === 'reasoning' ? previous.text : '') + chunk.text,
+       }
++      if (incremental && chunk.text.trim() !== '') visible = true
+       break
+     }
+     case 'tool-call-delta': {
+@@ -142,15 +154,19 @@ function updateChunk(state: AssistantState, match: ConversationMatch): Assistant
+         name: chunk.name ?? base.name,
+         argsRaw: base.argsRaw + chunk.argumentsDelta,
+       }
++      // Tool-call blocks do not count as visible content (hasVisibleContent).
+       break
+     }
+-    case 'block-end':
+-      blocks[chunk.index] = toAssistantBlock(chunk.block)
++    case 'block-end': {
++      const block = toAssistantBlock(chunk.block)
++      blocks[chunk.index] = block
++      if (incremental && hasVisibleContent([block])) visible = true
+       break
++    }
+     default:
+       return { ...state, sawChunk: true }
+   }
+-  const visible = hasVisibleContent(compactBlocks(blocks))
++  if (!incremental) visible = hasVisibleContent(compactBlocks(blocks))
+   return {
+     ...state,
+     sawChunk: true,
+diff --git a/packages/client/ui-trajectory/src/client/trajectory-tool-definition.ts b/packages/client/ui-trajectory/src/client/trajectory-tool-definition.ts
+index 7e069dd..8fe65ab 100644
+--- a/packages/client/ui-trajectory/src/client/trajectory-tool-definition.ts
++++ b/packages/client/ui-trajectory/src/client/trajectory-tool-definition.ts
+@@ -4,6 +4,7 @@ import type {
+   RunningToolCall, ToolCallBlock, ToolResultNode,
+ } from '@deepseek-ai/dsh-client-runtime/client'
+ import type {} from '@deepseek-ai/dsh-tools/types'
++import { isPerfEnabled } from './perf.ts'
+ import { trajectoryNode } from './trajectory-definition-common.ts'
+ 
+ /* jscpd:ignore-start -- Target-owned Definitions intentionally keep their event
+@@ -109,29 +110,40 @@ function childResult(
+   }
+ }
+ 
++/**
++ * Cycle guard plus MAX_DEPTH budget check for a candidate parent→child edge.
++ * The performance-switch fast path keeps only the O(depth) ancestor-cycle
++ * walk: the former subtree BFS here enforced MAX_DEPTH eagerly on every edge
++ * insert, which made history replay (one edge per dispatch event) quadratic in
++ * the call count. Depth is still bounded at projection time — projectCall
++ * truncates past MAX_DEPTH — so display stays safe without the per-insert
++ * scan. Disabled, the full subtree BFS budget check runs as before.
++ */
+ function acceptsEdge(state: ToolState, parent: string, child: string): boolean {
+   if (parent === child || state.parents.has(child)) return false
+   let cursor: string | undefined = parent
+-  let parentDepth = 0
+   const ancestors = new Set<string>()
+   while (cursor !== undefined) {
+     if (cursor === child || ancestors.has(cursor)) return false
+     ancestors.add(cursor)
+-    parentDepth++
+     cursor = state.parents.get(cursor)
+   }
+-  const pending = [{ callId: child, depth: 1 }]
+-  const descendants = new Set<string>()
+-  let subtreeDepth = 0
+-  for (const candidate of pending) {
+-    if (descendants.has(candidate.callId)) return false
+-    descendants.add(candidate.callId)
+-    subtreeDepth = Math.max(subtreeDepth, candidate.depth)
+-    for (const nested of state.children.get(candidate.callId) ?? []) {
+-      pending.push({ callId: nested, depth: candidate.depth + 1 })
++  if (!isPerfEnabled()) {
++    const pending = [{ callId: child, depth: 1 }]
++    const descendants = new Set<string>()
++    let subtreeDepth = 0
++    for (const candidate of pending) {
++      if (descendants.has(candidate.callId)) return false
++      descendants.add(candidate.callId)
++      subtreeDepth = Math.max(subtreeDepth, candidate.depth)
++      for (const nested of state.children.get(candidate.callId) ?? []) {
++        pending.push({ callId: nested, depth: candidate.depth + 1 })
++      }
+     }
++    const parentDepth = ancestors.size
++    if (parentDepth + subtreeDepth > MAX_DEPTH) return false
+   }
+-  return parentDepth + subtreeDepth <= MAX_DEPTH
++  return true
+ }
+ 
+ function updateDispatch(state: ToolState, match: ConversationMatch): ToolState {
+diff --git a/packages/host/apiproxy/src/api-proxy.ts b/packages/host/apiproxy/src/api-proxy.ts
+index bda9936..c9c0023 100644
+--- a/packages/host/apiproxy/src/api-proxy.ts
++++ b/packages/host/apiproxy/src/api-proxy.ts
+@@ -124,7 +124,7 @@ const DEFAULT_MAX_MESSAGES = 50
+  * is deferred work.
+  */
+ const WEB_SETTINGS_NAMESPACES = [
+-  'agent-loop', 'shell', 'locale', 'permission', 'ui-conversation', 'ui-theme', 'web-search-deepseek',
++  'agent-loop', 'shell', 'locale', 'permission', 'ui-conversation', 'ui-theme', 'web-search-deepseek', 'webui-perf',
+ ] as const
+ 
+ /** Provider work budget: at most 100 calls and 2,000 inspected hits. */

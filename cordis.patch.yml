@@ -1,0 +1,6 @@
+# dsh-webui-perf bundle patch：注册 WebUI 性能优化设置项（host 侧 settings namespace）。
+# 浏览器 half 在设置面板「通用」区渲染开关行，并把开关状态通过
+# localStorage + CustomEvent 广播给官方包的优化代码（cordis-free 通道）。
+- insert:
+    - id: dsh-webui-perf
+      name: dsh-webui-perf

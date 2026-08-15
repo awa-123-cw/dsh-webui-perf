@@ -1,0 +1,23 @@
+{
+  "name": "dsh-webui-perf",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WebUI 性能优化开关：设置面板一键开/关长代码流式渲染、历史加载、高亮/KaTeX/渲染缓存等优化",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "license": "MIT"
+}

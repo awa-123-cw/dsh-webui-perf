@@ -1,0 +1,5 @@
+# 依赖 junction（运行时解析 schemastery 用），不提交
+node_modules/
+# 调试/备份产物
+host-debug.log
+*.bak-*
