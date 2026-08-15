@@ -1,0 +1,8 @@
+2026-08-15T16:15:15.565Z === deep clean start ===
+2026-08-15T16:15:15.565Z ps1 bytes=4711
+2026-08-15T16:15:15.565Z outFile=C:\Users\ADMINI~1\AppData\Local\Temp\dsh-webui-perf-zaM7jK\result.json
+2026-08-15T16:15:17.682Z direct run: exit ok
+2026-08-15T16:15:17.683Z direct stdout: {"beforeFreeKB":25997664,"afterFreeKB":27091904,"freedGB":1.04,"freedWSGB":2.86,"cleared":180,"admin":true,"privProfile":true,"privQuota":true,"steps":{"perProcess":"ok(180)","purgeStandby":"0xC0000061","purgeLowStandby":"0xC0000061","registry":"ok"},"elevated":true}
+
+2026-08-15T16:15:18.184Z direct result: {"beforeFreeKB":25997664,"afterFreeKB":27091904,"freedGB":1.04,"freedWSGB":2.86,"cleared":180,"admin":true,"privProfile":true,"privQuota":true,"steps":{"perProcess":"ok(180)","purgeStandby":"0xC0000061","purgeLowStandby":"0xC0000061","registry":"ok"},"elevated":true}
+2026-08-15T16:15:18.185Z finish: usedUac=false result={"beforeFreeKB":25997664,"afterFreeKB":27091904,"freedGB":1.04,"freedWSGB":2.86,"cleared":180,"admin":true,"privProfile":true,"privQuota":true,"steps":{"perProcess":"ok(180)","purgeStandby":"0xC0000061","purgeLowStandby":"0xC0000061","registry":"ok"},"elevated":true}
